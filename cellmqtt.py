@@ -3,8 +3,8 @@ import time
 import math
 import serial
 import schedule
-import mqtt_codec.io
 import configparser
+import mqtt_codec.io
 import mqtt_codec.packet
 
 from enum import Enum
@@ -15,6 +15,7 @@ from functools import total_ordering
 config = configparser.ConfigParser()
 config.read(os.path.dirname(os.path.realpath(__file__)) + '/config.ini')
 
+#Constants used to recognize MQTT packets
 MQTT_PKT_TYPE_MASK = 0xF0
 MQTT_PUBLISH = 0x30
 MQTT_PINGREQ = b"\xc0\0"
@@ -42,48 +43,108 @@ class LogLevel(Enum):
         return NotImplemented
 
 class MQTTPacketException(Exception):
+    """ Malformed or unexpected packets read off the serial bus
+    """
     pass
 
+#An actual error received from the MQTT broker, possible error codes:
+
+
 class MQTTServerException(Exception):
+    """ Malformed or unexpected packets read off the serial bus
+    	
+    * 0x01 Connection Refused, unacceptable protocol version
+    * 0x02 Connection Refused, identifier rejected
+    * 0x03 Connection Refused, Server unavailable
+    * 0x04 Connection Refused, bad user name or password
+    * 0x05 Connection Refused, not authorized
+    """
     pass
 
 class CellMQTT:
+    """ Cellular MQTT Library for IoT devices like the Raspberry Pi
+    """
 
     def __init__(self, 
-    log_level = LogLevel.INFO, 
-    serial_path = config['SERIAL_PORT']['SerialPath'], 
-    baud_rate=config['SERIAL_PORT']['BaudRate'], 
-    timeout=config['SERIAL_PORT']['Timeout'], 
-    cell_chip = WirelessChip.SIM800C, 
-    cell_apn = config['CELLULAR']['APN']):
-        self._ser = serial.Serial(serial_path, baud_rate, timeout=int(timeout))
+    log_level: LogLevel = LogLevel.INFO, 
+    serial_path: str = config['SERIAL_PORT']['SerialPath'], 
+    baud_rate: int = config['SERIAL_PORT']['BaudRate'], 
+    timeout: int = config['SERIAL_PORT']['Timeout'], 
+    cell_chip: WirelessChip = WirelessChip.SIM800C, 
+    cell_apn: int = config['CELLULAR']['APN']):
+        """ Initialize a MQTT client object
+
+        Args:
+            log_level (LogLevel, optional): [description]. Defaults to LogLevel.INFO.
+            serial_path (str, optional): Path to the serial port cellular module is connected to. Defaults to config['SERIAL_PORT']['SerialPath'].
+            baud_rate (int, optional):  Baud rate for your cell chip - check datasheet. Defaults to config['SERIAL_PORT']['BaudRate'].
+            timeout (int, optional): Timeout for serial client - best to leave at 1s. Defaults to config['SERIAL_PORT']['Timeout'].
+            cell_chip (WirelessChip, optional): Defaults to WirelessChip.SIM800C.
+            cell_apn (int, optional): [description]. APN for your cellular provider. Defaults to config['CELLULAR']['APN'].
+        """
+        self._ser = serial.Serial(serial_path, baud_rate, timeout = int(timeout))
         self._cell_chip = cell_chip
         self._cell_apn = cell_apn
         self._log_level = log_level
 
-    def _log(self, level=LogLevel.INFO, component = 'main', message = ''):
+    def _log(self, level:LogLevel=LogLevel.INFO, component: str = 'main', message = ''):
+        """ Logger - see LogLevel enum above. Recommended to run with default log level of INFO to avoid large logfiles on edge devices
+
+        Args:
+            level (LogLevel, optional): [description]. Defaults to LogLevel.INFO.
+            component (str, optional): [description]. Defaults to 'main'.
+            message (any, optional): [description]. Defaults to ''.
+        """
         if(level >= self._log_level):
             print(str(datetime.utcnow()) + ' [' + str(level) + '] ' + str(message))
 
-    def _format_at_cmd(self, data):
+    def _format_at_cmd_sim800c(self, data: str) -> bytes:
+        """ AT command formatting for SIM800c chip
+
+        Args:
+            data (str): The actual command to be sent to the device
+
+        Returns:
+            bytes: encoded data to be written to serial bus
+        """
         data = 'AT+' + data + '\r\n'
         return data.encode()
 
-    def _at_disable_echo(self):
+    def _at_disable_echo_sim800c(self):
+        """ Command to disable echoing on serial bus - without this the SIM800c will echo back all data written to it
+        """
         self._ser.write('ATE0\r\n'.encode())
 
-    def _send_at_cmd(self, data, read=True):
-        self._ser.write(self._format_at_cmd(data))
+    def _send_at_cmd(self, data: str, read: bool = True):
+        """ Send AT command to cellular module
+
+        Args:
+            data (str): Raw, unformatted command text
+            read (bool, optional): If set to true, the command will read from the bus, even if it is not printing to log. Defaults to True.
+        """
+        self._ser.write(self._format_at_cmd_sim800c(data))
         time.sleep(1)
         if read:
             data = self._ser.read(14816)
             self._log(level=LogLevel.DEBUG, message=data)
 
-    def _send_cmd_await_response(self, data, response_len, initial_wait=1, burn_bytes=None, type=CMDType.BYTES):
+    def _send_cmd_await_response(self, data, response_len: int, initial_wait: int = 1, burn_bytes: int = None, type: CMDType = CMDType.BYTES) -> bytes:
+        """ Send a command or data to the cellular module and await a response of a known length
+
+        Args:
+            data (bytes | str): Data to be written to serial bus
+            response_len (int): The known response length that we will be looking for
+            initial_wait (int, optional): Amount of time to wait prior to looking for the response data. Defaults to 1.
+            burn_bytes (int, optional): How many bytes to burn until capturing the desired response. Defaults to None.
+            type (CMDType, optional): Defaults to CMDType.BYTES.
+
+        Returns:
+            bytes: This is the best effort captured response, which should then be validated by the requesting function
+        """
         if(type is CMDType.BYTES):
             self._ser.write(data)
         elif(type is CMDType.AT):
-            self._ser.write(self._format_at_cmd(data))
+            self._ser.write(self._format_at_cmd_sim800c(data))
         if(initial_wait is not None):
             time.sleep(initial_wait)
         if(burn_bytes is not None):
@@ -91,7 +152,19 @@ class CellMQTT:
             self._log(level=LogLevel.DEBUG, message = self._ser.read(burn_bytes))
         return self._ser.read(response_len)
 
-    def _tcp_connect(self, host, port, tls=False):
+    def _tcp_connect_sim800c(self, host: str, port: int, tls: bool = False):
+        """ Establish a TCP connection to a remote host
+
+        Args:
+            host (str)
+            port (int)
+            tls (bool, optional): When set to True, the SIM800c will attempt TLSv1 negotiation. Note that the chip 
+            is unfortunately not capable of any TLS version above TLSv1. Defaults to False.
+
+        Raises:
+            Exception: Will be raised when TCP connection can't be negotiated. This can either be caught by user
+            or cause the program to exit and be restarted by a supervisor like systemd.
+        """
         self._log(message = 'Establishing TCP connection...')
         self._send_at_cmd('CIPCLOSE')
         self._send_at_cmd('CIPSHUT')
@@ -106,7 +179,17 @@ class CellMQTT:
             raise Exception('could not establish tcp connection with server')
         self._log(message = 'TCP connection established.')
 
-    def _process_connack(self, packet):
+    def _process_connack(self, packet: bytearray):
+        """ Process the MQTT connack packet - see more here: 
+        http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718033
+
+        Args:
+            packet (bytearray): Raw connack packet to be validated
+
+        Raises:
+            MQTTPacketException
+            MQTTServerException
+        """
         if(len(packet) is not 3):
             raise MQTTPacketException('connack error: invalid packet length')
         if(packet[0] is not 0x02):
@@ -115,10 +198,28 @@ class CellMQTT:
             raise MQTTServerException('connack error: server refused connection with error code: ' + str(packet[2]))
         self._log(level=LogLevel.DEBUG, message = 'connack packet: ' + str(packet))
 
-    def connect(self, client_id = config['MQTT_BROKER']['MQTTClientID'], host = config['MQTT_BROKER']['MQTTHost'], port = config['MQTT_BROKER']['MQTTPort'], username = config['MQTT_BROKER']['MQTTUsername'], password = config['MQTT_BROKER']['MQTTPassword'], keep_alive=int(config['MQTT_BROKER']['MQTTKeepAlive']), tls=config['MQTT_BROKER']['MQTTSSL']):
+    def connect(self, 
+    client_id: str = config['MQTT_BROKER']['MQTTClientID'], 
+    host: str = config['MQTT_BROKER']['MQTTHost'], 
+    port: int = config['MQTT_BROKER']['MQTTPort'], 
+    username: str = config['MQTT_BROKER']['MQTTUsername'], 
+    password: str = config['MQTT_BROKER']['MQTTPassword'], 
+    keep_alive: int = int(config['MQTT_BROKER']['MQTTKeepAlive']), 
+    tls: bool = config['MQTT_BROKER']['MQTTSSL']):
+        """ Connect to an MQTT broker via the cellular chip.
+
+        Args:
+            client_id (str, optional): Defaults to config['MQTT_BROKER']['MQTTClientID'].
+            host (str, optional): Defaults to config['MQTT_BROKER']['MQTTHost'].
+            port (int, optional): Defaults to config['MQTT_BROKER']['MQTTPort'].
+            username (str, optional): Defaults to config['MQTT_BROKER']['MQTTUsername'].
+            password (str, optional): Defaults to config['MQTT_BROKER']['MQTTPassword'].
+            keep_alive (int, optional): Recommended to use a keep_alive interval. Defaults to int(config['MQTT_BROKER']['MQTTKeepAlive']).
+            tls (bool, optional): Defaults to config['MQTT_BROKER']['MQTTSSL'].
+        """
         self._log(message = 'Attempting connection to MQTT broker...')
-        self._at_disable_echo()
-        self._tcp_connect(host, port, tls=tls)
+        self._at_disable_echo_sim800c()
+        self._tcp_connect_sim800c(host, port, tls=tls)
         self._mqtt_keepalive = keep_alive
         connect = mqtt_codec.packet.MqttConnect(client_id=client_id, clean_session=False, keep_alive=30, username=username, password=password)
         with BytesIO() as f:
@@ -136,7 +237,9 @@ class CellMQTT:
                 time.sleep(5)
                 self._connect(client_id, host, port, username, password, keep_alive)
 
-    def _get_mqtt_ping_msg(self):
+    def _get_mqtt_ping_msg(self) -> MQTT_PINGRESP | None:
+        """ Find the MQTT PINGRESP packet in order to validate a ping response
+        """
         res = self._ser.read(1)
         if res in [None, b"", b"\x00"]:
             return None
@@ -144,6 +247,11 @@ class CellMQTT:
             return MQTT_PINGRESP
 
     def _mqtt_ping(self):
+        """ Ping the MQTT broker
+
+        Raises:
+            Exception: Raised if no valid ping response is received from the MQTT broker
+        """
         self._send_at_cmd('CIPSEND=2')
         self._ser.write(b'\xc0\x00')
         ping_timeout = self._mqtt_keepalive
@@ -156,7 +264,16 @@ class CellMQTT:
             if time.monotonic() - stamp > ping_timeout:
                 raise Exception("mqtt ping did not get response from broker")
 
-    def publish(self, topic,message, dupe=False, qos=0, retain=False):
+    def publish(self, topic: str, message: bytearray, dupe: bool = False, qos: int = 0, retain: bool = False):
+        """ Publish a message to a MQTT topic
+
+        Args:
+            topic (str)
+            message (bytearray)
+            dupe (bool, optional): Defaults to False.
+            qos (int, optional): Defaults to 0.
+            retain (bool, optional): Defaults to False.
+        """
         publish = mqtt_codec.packet.MqttPublish(3, topic, message.encode(), dupe, qos, retain)
         with BytesIO() as f:
             num_bytes_written = publish.encode(f)
@@ -164,7 +281,18 @@ class CellMQTT:
             self._send_at_cmd('CIPSEND=' + str(num_bytes_written))
             self._ser.write(buf)
 
-    def subscribe(self, topic):
+    def subscribe(self, topic: str):
+        """ Subscribe to a MQTT topic
+
+        Args:
+            topic (str)
+
+        Raises:
+            MQTTPacketException: Raised if the server does not send back a valid subscription acknowledgement
+            packet. 
+
+            More: http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718068
+        """
         subscribe = mqtt_codec.packet.MqttSubscribe(3, [mqtt_codec.packet.MqttTopic(topic, 0)])
         with BytesIO() as f:
             num_bytes_written = subscribe.encode(f)
@@ -178,7 +306,12 @@ class CellMQTT:
             self._log(level=LogLevel.DEBUG, message = 'suback packet: ' + str(res))
             self._log(level=LogLevel.DEBUG, message = 'Subscribed to topic: "' + topic + '"')
 
-    def _get_remaining_len(self):
+    def _get_remaining_len(self) -> int:
+        """ Get the remaining length in the publish packet using some bitmath.
+
+        Returns:
+            int
+        """
         n = 0
         sh = 0
         b = bytearray(1)
@@ -189,7 +322,12 @@ class CellMQTT:
                 return n
             sh += 7
 
-    def _check_for_publish_messages(self):
+    def _check_for_publish_messages(self) -> None:
+        """ Read serial bus one byte at a time, waiting for a MQTT_PUBLISH packet to arrive
+
+        Raises:
+            MQTTPacketException: Raised if the packet is malformed
+        """
         res = self._ser.read(1)
         if res in [None, b"", b"\x00"]:
             return None
