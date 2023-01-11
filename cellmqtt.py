@@ -10,7 +10,9 @@ import mqtt_codec.packet
 from enum import Enum
 from io import BytesIO
 from datetime import datetime
+from typing import Callable
 from functools import total_ordering
+
 
 config = configparser.ConfigParser()
 config.read(os.path.dirname(os.path.realpath(__file__)) + '/config.ini')
@@ -64,6 +66,7 @@ class MQTTServerException(Exception):
 class CellMQTT:
     """ Cellular MQTT Library for IoT devices like the Raspberry Pi
     """
+    _sub_handlers = {}
 
     def __init__(self, 
     log_level: LogLevel = LogLevel.INFO, 
@@ -198,46 +201,7 @@ class CellMQTT:
             raise MQTTServerException('connack error: server refused connection with error code: ' + str(packet[2]))
         self._log(level=LogLevel.DEBUG, message = 'connack packet: ' + str(packet))
 
-    def connect(self, 
-    client_id: str = config['MQTT_BROKER']['MQTTClientID'], 
-    host: str = config['MQTT_BROKER']['MQTTHost'], 
-    port: int = config['MQTT_BROKER']['MQTTPort'], 
-    username: str = config['MQTT_BROKER']['MQTTUsername'], 
-    password: str = config['MQTT_BROKER']['MQTTPassword'], 
-    keep_alive: int = int(config['MQTT_BROKER']['MQTTKeepAlive']), 
-    tls: bool = config['MQTT_BROKER']['MQTTSSL']):
-        """ Connect to an MQTT broker via the cellular chip.
-
-        Args:
-            client_id (str, optional): Defaults to config['MQTT_BROKER']['MQTTClientID'].
-            host (str, optional): Defaults to config['MQTT_BROKER']['MQTTHost'].
-            port (int, optional): Defaults to config['MQTT_BROKER']['MQTTPort'].
-            username (str, optional): Defaults to config['MQTT_BROKER']['MQTTUsername'].
-            password (str, optional): Defaults to config['MQTT_BROKER']['MQTTPassword'].
-            keep_alive (int, optional): Recommended to use a keep_alive interval. Defaults to int(config['MQTT_BROKER']['MQTTKeepAlive']).
-            tls (bool, optional): Defaults to config['MQTT_BROKER']['MQTTSSL'].
-        """
-        self._log(message = 'Attempting connection to MQTT broker...')
-        self._at_disable_echo_sim800c()
-        self._tcp_connect_sim800c(host, port, tls=tls)
-        self._mqtt_keepalive = keep_alive
-        connect = mqtt_codec.packet.MqttConnect(client_id=client_id, clean_session=False, keep_alive=30, username=username, password=password)
-        with BytesIO() as f:
-            num_bytes_written = connect.encode(f)
-            buf = f.getvalue()
-            self._send_at_cmd('CIPSEND=' + str(num_bytes_written))
-            connack_packet = self._send_cmd_await_response(buf,3,burn_bytes=12)
-            try:
-                self._process_connack(connack_packet)
-                if(keep_alive is not None):
-                    schedule.every(math.ceil(keep_alive/2)).seconds.do(self._mqtt_ping)
-                self._log(message = 'Sucessfully connected to MQTT broker.')
-            except MQTTPacketException:
-                # if there was a problem reading the connack packet, reconnect
-                time.sleep(5)
-                self._connect(client_id, host, port, username, password, keep_alive)
-
-    def _get_mqtt_ping_msg(self) -> MQTT_PINGRESP | None:
+    def _get_mqtt_ping_msg(self) -> MQTT_PINGRESP:
         """ Find the MQTT PINGRESP packet in order to validate a ping response
         """
         res = self._ser.read(1)
@@ -263,48 +227,6 @@ class CellMQTT:
                 self._log(level=LogLevel.DEBUG, message = 'mqtt ping got response from broker')
             if time.monotonic() - stamp > ping_timeout:
                 raise Exception("mqtt ping did not get response from broker")
-
-    def publish(self, topic: str, message: bytearray, dupe: bool = False, qos: int = 0, retain: bool = False):
-        """ Publish a message to a MQTT topic
-
-        Args:
-            topic (str)
-            message (bytearray)
-            dupe (bool, optional): Defaults to False.
-            qos (int, optional): Defaults to 0.
-            retain (bool, optional): Defaults to False.
-        """
-        publish = mqtt_codec.packet.MqttPublish(3, topic, message.encode(), dupe, qos, retain)
-        with BytesIO() as f:
-            num_bytes_written = publish.encode(f)
-            buf = f.getvalue()
-            self._send_at_cmd('CIPSEND=' + str(num_bytes_written))
-            self._ser.write(buf)
-
-    def subscribe(self, topic: str):
-        """ Subscribe to a MQTT topic
-
-        Args:
-            topic (str)
-
-        Raises:
-            MQTTPacketException: Raised if the server does not send back a valid subscription acknowledgement
-            packet. 
-
-            More: http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718068
-        """
-        subscribe = mqtt_codec.packet.MqttSubscribe(3, [mqtt_codec.packet.MqttTopic(topic, 0)])
-        with BytesIO() as f:
-            num_bytes_written = subscribe.encode(f)
-            buf = f.getvalue()
-            self._send_at_cmd('CIPSEND=' + str(num_bytes_written))
-            res = self._send_cmd_await_response(buf,5,burn_bytes=11)
-            if(len(res) is not 5):
-                raise MQTTPacketException('subscription error: invalid packet length')
-            if(res[0] is not 0x90):
-                raise MQTTPacketException('subscription error: invalid fixed header')
-            self._log(level=LogLevel.DEBUG, message = 'suback packet: ' + str(res))
-            self._log(level=LogLevel.DEBUG, message = 'Subscribed to topic: "' + topic + '"')
 
     def _get_remaining_len(self) -> int:
         """ Get the remaining length in the publish packet using some bitmath.
@@ -346,8 +268,94 @@ class CellMQTT:
                 remaining_len -= 0x02
             raw_msg = self._ser.read(remaining_len)
             msg = str(raw_msg, "utf-8")
+            if topic in self._sub_handlers:
+                self._sub_handlers[topic](topic, raw_msg)
             self._log(level=LogLevel.DEBUG, message = 'got message for topic: ' + topic )
             self._log(level=LogLevel.DEBUG, message = 'payload: ' + msg )
+
+    def connect(self, 
+    client_id: str = config['MQTT_BROKER']['MQTTClientID'], 
+    host: str = config['MQTT_BROKER']['MQTTHost'], 
+    port: int = config['MQTT_BROKER']['MQTTPort'], 
+    username: str = config['MQTT_BROKER']['MQTTUsername'], 
+    password: str = config['MQTT_BROKER']['MQTTPassword'], 
+    keep_alive: int = int(config['MQTT_BROKER']['MQTTKeepAlive']), 
+    tls: bool = config['MQTT_BROKER']['MQTTSSL']):
+        """ Connect to an MQTT broker via the cellular chip.
+
+        Args:
+            client_id (str, optional): Defaults to config['MQTT_BROKER']['MQTTClientID'].
+            host (str, optional): Defaults to config['MQTT_BROKER']['MQTTHost'].
+            port (int, optional): Defaults to config['MQTT_BROKER']['MQTTPort'].
+            username (str, optional): Defaults to config['MQTT_BROKER']['MQTTUsername'].
+            password (str, optional): Defaults to config['MQTT_BROKER']['MQTTPassword'].
+            keep_alive (int, optional): Recommended to use a keep_alive interval. Defaults to int(config['MQTT_BROKER']['MQTTKeepAlive']).
+            tls (bool, optional): Defaults to config['MQTT_BROKER']['MQTTSSL'].
+        """
+        self._log(message = 'Attempting connection to MQTT broker...')
+        self._at_disable_echo_sim800c()
+        self._tcp_connect_sim800c(host, port, tls=tls)
+        self._mqtt_keepalive = keep_alive
+        connect = mqtt_codec.packet.MqttConnect(client_id=client_id, clean_session=False, keep_alive=30, username=username, password=password)
+        with BytesIO() as f:
+            num_bytes_written = connect.encode(f)
+            buf = f.getvalue()
+            self._send_at_cmd('CIPSEND=' + str(num_bytes_written))
+            connack_packet = self._send_cmd_await_response(buf,3,burn_bytes=12)
+            try:
+                self._process_connack(connack_packet)
+                if(keep_alive is not None):
+                    schedule.every(math.ceil(keep_alive/2)).seconds.do(self._mqtt_ping)
+                self._log(message = 'Sucessfully connected to MQTT broker.')
+            except MQTTPacketException:
+                # if there was a problem reading the connack packet, reconnect
+                time.sleep(5)
+                self._connect(client_id, host, port, username, password, keep_alive)
+
+    def publish(self, topic: str, message: bytearray, dupe: bool = False, qos: int = 0, retain: bool = False):
+        """ Publish a message to a MQTT topic
+
+        Args:
+            topic (str)
+            message (bytearray)
+            dupe (bool, optional): Defaults to False.
+            qos (int, optional): Defaults to 0.
+            retain (bool, optional): Defaults to False.
+        """
+        publish = mqtt_codec.packet.MqttPublish(3, topic, message.encode(), dupe, qos, retain)
+        with BytesIO() as f:
+            num_bytes_written = publish.encode(f)
+            buf = f.getvalue()
+            self._send_at_cmd('CIPSEND=' + str(num_bytes_written))
+            self._ser.write(buf)
+
+    def subscribe(self, topic: str, handler: Callable[[str,bytes],None]):
+        """ Subscribe to a MQTT topic
+
+        Args:
+            topic (str)
+            handler (Callable[[str,bytes],None]): This function will be called when a message arrives on this topic
+              > The function should accept two arguments: topic (str) and message (bytes)
+
+        Raises:
+            MQTTPacketException: Raised if the server does not send back a valid subscription acknowledgement
+            packet. 
+
+            More: http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718068
+        """
+        subscribe = mqtt_codec.packet.MqttSubscribe(3, [mqtt_codec.packet.MqttTopic(topic, 0)])
+        with BytesIO() as f:
+            num_bytes_written = subscribe.encode(f)
+            buf = f.getvalue()
+            self._send_at_cmd('CIPSEND=' + str(num_bytes_written))
+            res = self._send_cmd_await_response(buf,5,burn_bytes=11)
+            if(len(res) is not 5):
+                raise MQTTPacketException('subscription error: invalid packet length')
+            if(res[0] is not 0x90):
+                raise MQTTPacketException('subscription error: invalid fixed header')
+            self._log(level=LogLevel.DEBUG, message = 'suback packet: ' + str(res))
+            self._log(level=LogLevel.DEBUG, message = 'Subscribed to topic: "' + topic + '"')
+            self._sub_handlers[topic] = handler
 
     def loop(self):
         while True:

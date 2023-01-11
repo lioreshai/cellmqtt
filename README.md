@@ -10,6 +10,38 @@ I also tried to make the API as chip-agnostic as possible, so while there is onl
 
 ## Getting Started
 
+```python
+# Schedule library is required to run event-based commands while the forever-loop is running
+import schedule
+
+from datetime import datetime
+from cellmqtt import CellMQTT, LogLevel, WirelessChip
+
+# Initialize a CellMQTT instance with your wireless chip and desired log level
+#  > Values can be overridden here, but it is cleaner to configure them from 
+#  > a config.ini in your project directory
+cmqtt = CellMQTT(cell_chip=WirelessChip.SIM800C, log_level=LogLevel.DEBUG)
+
+# You can also override MQTT connection parameters:
+# > cmqtt.connect(host='test.com', port=1883)
+# > or, just use none and they will be pulled from config.ini:
+cmqtt.connect()
+
+def handle_test(topic: str, message: bytes):
+    print('------ GOT MSG FROM TOPIC: ' + topic + '! ------')
+    print(str(message, 'utf-8'))
+    print('------ END OF MESSAGE ------')
+
+cmqtt.subscribe('ext/test', handle_test)
+
+def publish_demo():
+    cmqtt.publish('ext/test/date', str(datetime.utcnow()))
+
+schedule.every(40).seconds.do(publish_demo)
+
+cmqtt.loop()
+```
+
 ### Configuration
 
 There is a `config-sample.ini` file which should be renamed to `config.ini`. These values can also be overridden when initializing the `CellMQTT` class in your program.
