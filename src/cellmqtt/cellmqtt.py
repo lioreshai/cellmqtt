@@ -2,6 +2,7 @@ import os
 import time
 import math
 import serial
+import logging
 import schedule
 import configparser
 import mqtt_codec.io
@@ -9,9 +10,8 @@ import mqtt_codec.packet
 
 from enum import Enum
 from io import BytesIO
-from datetime import datetime
 from typing import Callable
-from functools import total_ordering
+from datetime import datetime
 
 
 config = configparser.ConfigParser()
@@ -32,17 +32,6 @@ class WirelessChip(Enum):
 class CMDType(Enum):
     AT = 1
     BYTES = 2
-
-@total_ordering
-class LogLevel(Enum):
-    DEBUG = 1
-    INFO = 2
-    WARNING = 3
-    ERROR = 4
-    def __lt__(self, other):
-        if self.__class__ is other.__class__:
-            return self.value < other.value
-        return NotImplemented
 
 class MQTTPacketException(Exception):
     """ Malformed or unexpected packets read off the serial bus
@@ -69,7 +58,7 @@ class CellMQTT:
     _sub_handlers = {}
 
     def __init__(self, 
-    log_level: LogLevel = LogLevel.INFO, 
+    log_level =  logging.INFO, 
     serial_path: str = config['SERIAL_PORT']['SerialPath'], 
     baud_rate: int = config['SERIAL_PORT']['BaudRate'], 
     timeout: int = config['SERIAL_PORT']['Timeout'], 
@@ -88,18 +77,8 @@ class CellMQTT:
         self._ser = serial.Serial(serial_path, baud_rate, timeout = int(timeout))
         self._cell_chip = cell_chip
         self._cell_apn = cell_apn
-        self._log_level = log_level
-
-    def _log(self, level:LogLevel=LogLevel.INFO, component: str = 'main', message = ''):
-        """ Logger - see LogLevel enum above. Recommended to run with default log level of INFO to avoid large logfiles on edge devices
-
-        Args:
-            level (LogLevel, optional): [description]. Defaults to LogLevel.INFO.
-            component (str, optional): [description]. Defaults to 'main'.
-            message (any, optional): [description]. Defaults to ''.
-        """
-        if(level >= self._log_level):
-            print(str(datetime.utcnow()) + ' [' + str(level) + '] ' + str(message))
+        logging.basicConfig(level=log_level, format='%(asctime)s - %(message)s', )
+        self._log = logging.getLogger(__name__)
 
     def _format_at_cmd_sim800c(self, data: str) -> bytes:
         """ AT command formatting for SIM800c chip
@@ -129,7 +108,7 @@ class CellMQTT:
         time.sleep(1)
         if read:
             data = self._ser.read(14816)
-            self._log(level=LogLevel.DEBUG, message=data)
+            self._log.debug(data)
 
     def _send_cmd_await_response(self, data, response_len: int, initial_wait: int = 1, burn_bytes: int = None, type: CMDType = CMDType.BYTES) -> bytes:
         """ Send a command or data to the cellular module and await a response of a known length
@@ -151,8 +130,8 @@ class CellMQTT:
         if(initial_wait is not None):
             time.sleep(initial_wait)
         if(burn_bytes is not None):
-            self._log(level=LogLevel.DEBUG, message = 'Read ' + str(burn_bytes) + ' bytes before response: ')
-            self._log(level=LogLevel.DEBUG, message = self._ser.read(burn_bytes))
+            self._log.debug('Read ' + str(burn_bytes) + ' bytes before response: ')
+            self._log.debug(self._ser.read(burn_bytes))
         return self._ser.read(response_len)
 
     def _tcp_connect_sim800c(self, host: str, port: int, tls: bool = False):
@@ -168,7 +147,7 @@ class CellMQTT:
             Exception: Will be raised when TCP connection can't be negotiated. This can either be caught by user
             or cause the program to exit and be restarted by a supervisor like systemd.
         """
-        self._log(message = 'Establishing TCP connection...')
+        self._log.info('Establishing TCP connection...')
         self._send_at_cmd('CIPCLOSE')
         self._send_at_cmd('CIPSHUT')
         self._send_at_cmd('CGATT?')
@@ -180,7 +159,7 @@ class CellMQTT:
         response = self._send_cmd_await_response('CIPSTART="TCP","' + host + '",' + str(port), 10, burn_bytes=8, type=CMDType.AT)
         if response != b'CONNECT OK':
             raise Exception('could not establish tcp connection with server')
-        self._log(message = 'TCP connection established.')
+        self._log.info('TCP connection established.')
 
     def _process_connack(self, packet: bytearray):
         """ Process the MQTT connack packet - see more here: 
@@ -199,7 +178,7 @@ class CellMQTT:
             raise MQTTPacketException('connack error: invalid fixed header in packet')
         if(packet[2] is not 0x00):
             raise MQTTServerException('connack error: server refused connection with error code: ' + str(packet[2]))
-        self._log(level=LogLevel.DEBUG, message = 'connack packet: ' + str(packet))
+        self._log.debug(message = 'connack packet: ' + str(packet))
 
     def _get_mqtt_ping_msg(self) -> MQTT_PINGRESP:
         """ Find the MQTT PINGRESP packet in order to validate a ping response
@@ -224,7 +203,7 @@ class CellMQTT:
         while res != MQTT_PINGRESP:
             res = self._get_mqtt_ping_msg()
             if res:
-                self._log(level=LogLevel.DEBUG, message = 'mqtt ping got response from broker')
+                self._log.debug('mqtt ping got response from broker')
             if time.monotonic() - stamp > ping_timeout:
                 raise Exception("mqtt ping did not get response from broker")
 
@@ -270,8 +249,15 @@ class CellMQTT:
             msg = str(raw_msg, "utf-8")
             if topic in self._sub_handlers:
                 self._sub_handlers[topic](topic, raw_msg)
-            self._log(level=LogLevel.DEBUG, message = 'got message for topic: ' + topic )
-            self._log(level=LogLevel.DEBUG, message = 'payload: ' + msg )
+            self._log.debug('got message for topic: ' + topic )
+            self._log.debug('payload: ' + msg )
+
+    def _send_queued_publish_jobs(self):
+        if self._queued_publish_bytes:
+            self._send_at_cmd('CIPSEND=' + str(self._queued_publish_bytes))
+            while len(self._publish_jobs):
+                self._ser.write(self._publish_jobs.pop())
+            self._queued_publish_bytes=0
 
     def connect(self, 
     client_id: str = config['MQTT_BROKER']['MQTTClientID'], 
@@ -292,7 +278,7 @@ class CellMQTT:
             keep_alive (int, optional): Recommended to use a keep_alive interval. Defaults to int(config['MQTT_BROKER']['MQTTKeepAlive']).
             tls (bool, optional): Defaults to config['MQTT_BROKER']['MQTTSSL'].
         """
-        self._log(message = 'Attempting connection to MQTT broker...')
+        self._log.info('Attempting connection to MQTT broker...')
         self._at_disable_echo_sim800c()
         self._tcp_connect_sim800c(host, port, tls=tls)
         self._mqtt_keepalive = keep_alive
@@ -306,7 +292,7 @@ class CellMQTT:
                 self._process_connack(connack_packet)
                 if(keep_alive is not None):
                     schedule.every(math.ceil(keep_alive/2)).seconds.do(self._mqtt_ping)
-                self._log(message = 'Sucessfully connected to MQTT broker.')
+                self._log.info('Sucessfully connected to MQTT broker.')
             except MQTTPacketException:
                 # if there was a problem reading the connack packet, reconnect
                 time.sleep(5)
@@ -326,8 +312,8 @@ class CellMQTT:
         with BytesIO() as f:
             num_bytes_written = publish.encode(f)
             buf = f.getvalue()
-            self._send_at_cmd('CIPSEND=' + str(num_bytes_written))
-            self._ser.write(buf)
+            self._publish_jobs.append(buf)
+            self._queued_publish_bytes = self._queued_publish_bytes + num_bytes_written
 
     def subscribe(self, topic: str, handler: Callable[[str,bytes],None]):
         """ Subscribe to a MQTT topic
@@ -353,12 +339,13 @@ class CellMQTT:
                 raise MQTTPacketException('subscription error: invalid packet length')
             if(res[0] is not 0x90):
                 raise MQTTPacketException('subscription error: invalid fixed header')
-            self._log(level=LogLevel.DEBUG, message = 'suback packet: ' + str(res))
-            self._log(level=LogLevel.DEBUG, message = 'Subscribed to topic: "' + topic + '"')
+            self._log.debug('suback packet: ' + str(res))
+            self._log.debug('Subscribed to topic: "' + topic + '"')
             self._sub_handlers[topic] = handler
 
     def loop(self):
         while True:
             schedule.run_pending()
             self._check_for_publish_messages()
+            self._send_queued_publish_jobs()
             time.sleep(.05)

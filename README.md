@@ -13,14 +13,15 @@ I also tried to make the API as chip-agnostic as possible, so while there is onl
 ```python
 # Schedule library is required to run event-based commands while the forever-loop is running
 import schedule
+import logging
 
 from datetime import datetime
-from cellmqtt import CellMQTT, LogLevel, WirelessChip
+from cellmqtt import CellMQTT, WirelessChip
 
 # Initialize a CellMQTT instance with your wireless chip and desired log level
 #  > Values can be overridden here, but it is cleaner to configure them from 
 #  > a config.ini in your project directory
-cmqtt = CellMQTT(cell_chip=WirelessChip.SIM800C, log_level=LogLevel.DEBUG)
+cmqtt = CellMQTT(cell_chip=WirelessChip.SIM800C, log_level = logging.DEBUG)
 
 # You can also override MQTT connection parameters:
 # > cmqtt.connect(host='test.com', port=1883)
