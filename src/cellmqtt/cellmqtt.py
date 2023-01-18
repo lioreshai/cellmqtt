@@ -56,6 +56,8 @@ class CellMQTT:
     """ Cellular MQTT Library for IoT devices like the Raspberry Pi
     """
     _sub_handlers = {}
+    _publish_jobs = []
+    _queued_publish_bytes = 0
 
     def __init__(self, 
     log_level =  logging.INFO, 
