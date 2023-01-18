@@ -15,7 +15,7 @@ from datetime import datetime
 
 
 config = configparser.ConfigParser()
-config.read(os.path.dirname(os.path.realpath(__file__)) + '/config.ini')
+config.read(os.getcwd() + '/config.ini')
 
 #Constants used to recognize MQTT packets
 MQTT_PKT_TYPE_MASK = 0xF0
@@ -178,7 +178,7 @@ class CellMQTT:
             raise MQTTPacketException('connack error: invalid fixed header in packet')
         if(packet[2] is not 0x00):
             raise MQTTServerException('connack error: server refused connection with error code: ' + str(packet[2]))
-        self._log.debug(message = 'connack packet: ' + str(packet))
+        self._log.debug('connack packet: ' + str(packet))
 
     def _get_mqtt_ping_msg(self) -> MQTT_PINGRESP:
         """ Find the MQTT PINGRESP packet in order to validate a ping response
