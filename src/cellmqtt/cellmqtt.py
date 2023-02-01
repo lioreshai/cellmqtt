@@ -245,7 +245,7 @@ class CellMQTT:
             if attempts > 5:
                 raise Exception('error initiating tcp send')
             attempts = attempts + 1
-            self._send_at_cmd('CIPSEND=' + str(len(data)))
+            self._send_at_cmd('CIPSEND=' + str(len(data)), wait_time=0)
             ready_to_send = self._await_serial_response(b'>')
             if attempts:
                 time.sleep(1)
