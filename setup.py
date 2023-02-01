@@ -5,17 +5,17 @@ with open('README.md', 'r', encoding='utf-8') as fh:
 
 setuptools.setup(
     name='cellmqtt',
-    author='pubudeux',
+    author='Liore Shai',
     description='Lightweight IoT MQTT library for mobile network chips.',
     keywords='MQTT, iot, cellular, gsm, gprs, sim800c',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url='https://github.com/pubudeux/cellmqtt',
+    url='https://github.com/lioreshai/cellmqtt',
     project_urls={
-        'Documentation': 'https://github.com/pubudeux/cellmqtt',
+        'Documentation': 'https://github.com/lioreshai/cellmqtt',
         'Bug Reports':
-        'https://github.com/pubudeux/cellmqtt/issues',
-        'Source Code': 'https://github.com/pubudeux/cellmqtt',
+        'https://github.com/lioreshai/cellmqtt/issues',
+        'Source Code': 'https://github.com/lioreshai/cellmqtt',
         # 'Funding': '',
         # 'Say Thanks!': '',
     },

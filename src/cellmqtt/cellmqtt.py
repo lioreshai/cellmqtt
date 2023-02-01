@@ -1,9 +1,7 @@
 
 import os
-from pickletools import int4
-import time
 import math
-from warnings import resetwarnings
+import time
 import serial
 
 import logging
@@ -15,7 +13,6 @@ import mqtt_codec.packet
 from enum import Enum
 from io import BytesIO
 from typing import Callable
-from datetime import datetime
 
 
 config = configparser.ConfigParser()
@@ -104,7 +101,7 @@ class CellMQTT:
         """
         self._ser.write('ATE0\r\n'.encode())
 
-    def _send_at_cmd(self, data: str, wait_time: float = 1):
+    def _send_at_cmd(self, data: str, wait_time: float = .4):
         """ Send AT command to cellular module
 
         Args:
@@ -112,6 +109,7 @@ class CellMQTT:
             read (bool, optional): If set to true, the command will read from the bus, even if it is not printing to log. Defaults to True.
         """
         self._ser.write(self._format_at_cmd_sim800c(data))
+        self._log.debug(str(data))
         if(wait_time):
             time.sleep(wait_time)
 
@@ -135,15 +133,15 @@ class CellMQTT:
             or cause the program to exit and be restarted by a supervisor like systemd.
         """
         self._log.info('Establishing TCP connection...')
-        self._send_at_cmd('CIPCLOSE')
-        self._send_at_cmd('CIPSHUT')
+        self._send_at_cmd('CIPCLOSE', wait_time=2)
+        self._send_at_cmd('CIPSHUT', wait_time=2)
         # self._send_at_cmd('CGATT?')
         self._send_at_cmd('CSTT="{}"'.format(self._cell_apn))
-        self._send_at_cmd('CIICR')
-        self._send_at_cmd('CIFSR')
+        self._send_at_cmd('CIICR', wait_time=2)
+        self._send_at_cmd('CIFSR', wait_time=2)
         if tls:
             self._send_at_cmd('CIPSSL=1')
-        self._send_at_cmd('CIPSTART="TCP","' + host + '",' + str(port))
+        self._send_at_cmd('CIPSTART="TCP","' + host + '",' + str(port), wait_time=2)
         connected = self._await_serial_response(b'CONNECT OK')
         if not connected:
             raise Exception('could not establish tcp connection with server')
@@ -175,19 +173,12 @@ class CellMQTT:
         stamp = time.monotonic()
         while res[0] != header_type:
             res = self._ser.read(1)
-            # if res in [None, b"", b"\x00"]:
-            #     return None
             if res[0] & MQTT_PKT_TYPE_MASK == header_type:
                 return res
             if time.monotonic() - stamp > timeout:
                 raise MQTTPacketException("timed out waiting for " + str(MQTT_SUBACK) + " fixed header byte")
 
     def _mqtt_ping(self):
-        """ Ping the MQTT broker
-
-        Raises:
-            Exception: Raised if no valid ping response is received from the MQTT broker
-        """
         self._tcp_send(b'\xc0\x00')
         self._wait_for_mqtt_fixed_header(MQTT_PINGRESP)
         self._log.debug('mqtt ping got response from broker')
@@ -259,7 +250,8 @@ class CellMQTT:
             if attempts:
                 time.sleep(1)
         self._ser.write(data)
-        self._await_serial_response(b"SEND OK")
+        if not self._await_serial_response(b"SEND OK"):
+            raise Exception("error on TCP send")
 
 
     def connect(self, 
@@ -294,7 +286,7 @@ class CellMQTT:
             self._log.debug("Got connack: " + str(connack_packet))
             self._process_connack(connack_packet)
             if(keep_alive is not None):
-                schedule.every(keep_alive).seconds.do(self._mqtt_ping)
+                schedule.every(math.ceil(keep_alive/2)).seconds.do(self._mqtt_ping)
             self._log.info('Sucessfully connected to MQTT broker.')
 
     def publish(self, topic: str, message: bytearray, dupe: bool = False, qos: int = 0, retain: bool = False):
