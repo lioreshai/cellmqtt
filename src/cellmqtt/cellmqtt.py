@@ -1,7 +1,11 @@
+
 import os
+from pickletools import int4
 import time
 import math
+from warnings import resetwarnings
 import serial
+
 import logging
 import schedule
 import configparser
@@ -23,6 +27,7 @@ MQTT_PUBLISH = 0x30
 MQTT_PINGREQ = b"\xc0\0"
 MQTT_PINGRESP = 0xD0
 MQTT_SUB = b"\x82"
+MQTT_SUBACK = 0x40
 MQTT_UNSUB = b"\xA2"
 MQTT_DISCONNECT = b"\xe0\0"
 
@@ -99,7 +104,7 @@ class CellMQTT:
         """
         self._ser.write('ATE0\r\n'.encode())
 
-    def _send_at_cmd(self, data: str, read: bool = True):
+    def _send_at_cmd(self, data: str, wait_time: float = 1):
         """ Send AT command to cellular module
 
         Args:
@@ -107,34 +112,14 @@ class CellMQTT:
             read (bool, optional): If set to true, the command will read from the bus, even if it is not printing to log. Defaults to True.
         """
         self._ser.write(self._format_at_cmd_sim800c(data))
-        time.sleep(1)
-        if read:
-            data = self._ser.read(14816)
-            self._log.debug(data)
+        if(wait_time):
+            time.sleep(wait_time)
 
-    def _send_cmd_await_response(self, data, response_len: int, initial_wait: int = 1, burn_bytes: int = None, type: CMDType = CMDType.BYTES) -> bytes:
-        """ Send a command or data to the cellular module and await a response of a known length
-
-        Args:
-            data (bytes | str): Data to be written to serial bus
-            response_len (int): The known response length that we will be looking for
-            initial_wait (int, optional): Amount of time to wait prior to looking for the response data. Defaults to 1.
-            burn_bytes (int, optional): How many bytes to burn until capturing the desired response. Defaults to None.
-            type (CMDType, optional): Defaults to CMDType.BYTES.
-
-        Returns:
-            bytes: This is the best effort captured response, which should then be validated by the requesting function
-        """
-        if(type is CMDType.BYTES):
-            self._ser.write(data)
-        elif(type is CMDType.AT):
-            self._ser.write(self._format_at_cmd_sim800c(data))
-        if(initial_wait is not None):
-            time.sleep(initial_wait)
-        if(burn_bytes is not None):
-            self._log.debug('Read ' + str(burn_bytes) + ' bytes before response: ')
-            self._log.debug(self._ser.read(burn_bytes))
-        return self._ser.read(response_len)
+    def _await_serial_response(self, expected: bytes) -> bool:
+        result = self._ser.read_until(expected)[-len(expected):]
+        self._log.debug('Expected:' + str(expected))
+        self._log.debug('Result:' + str(result))
+        return result == expected
 
     def _tcp_connect_sim800c(self, host: str, port: int, tls: bool = False):
         """ Establish a TCP connection to a remote host
@@ -152,14 +137,15 @@ class CellMQTT:
         self._log.info('Establishing TCP connection...')
         self._send_at_cmd('CIPCLOSE')
         self._send_at_cmd('CIPSHUT')
-        self._send_at_cmd('CGATT?')
+        # self._send_at_cmd('CGATT?')
         self._send_at_cmd('CSTT="{}"'.format(self._cell_apn))
         self._send_at_cmd('CIICR')
         self._send_at_cmd('CIFSR')
         if tls:
             self._send_at_cmd('CIPSSL=1')
-        response = self._send_cmd_await_response('CIPSTART="TCP","' + host + '",' + str(port), 10, burn_bytes=8, type=CMDType.AT)
-        if response != b'CONNECT OK':
+        self._send_at_cmd('CIPSTART="TCP","' + host + '",' + str(port))
+        connected = self._await_serial_response(b'CONNECT OK')
+        if not connected:
             raise Exception('could not establish tcp connection with server')
         self._log.info('TCP connection established.')
 
@@ -174,22 +160,27 @@ class CellMQTT:
             MQTTPacketException
             MQTTServerException
         """
-        if(len(packet) is not 3):
+        if(len(packet) != 3):
             raise MQTTPacketException('connack error: invalid packet length')
-        if(packet[0] is not 0x02):
+        if(packet[0] != 0x02):
             raise MQTTPacketException('connack error: invalid fixed header in packet')
-        if(packet[2] is not 0x00):
+        if(packet[2] != 0x00):
             raise MQTTServerException('connack error: server refused connection with error code: ' + str(packet[2]))
         self._log.debug('connack packet: ' + str(packet))
 
-    def _get_mqtt_ping_msg(self) -> MQTT_PINGRESP:
-        """ Find the MQTT PINGRESP packet in order to validate a ping response
+    def _wait_for_mqtt_fixed_header(self, header_type, timeout: int = 5) -> bytes:
+        """ Wait for a MQTT fixed header 
         """
-        res = self._ser.read(1)
-        if res in [None, b"", b"\x00"]:
-            return None
-        if res[0] & MQTT_PKT_TYPE_MASK == MQTT_PINGRESP:
-            return MQTT_PINGRESP
+        res = bytearray(1)
+        stamp = time.monotonic()
+        while res[0] != header_type:
+            res = self._ser.read(1)
+            # if res in [None, b"", b"\x00"]:
+            #     return None
+            if res[0] & MQTT_PKT_TYPE_MASK == header_type:
+                return res
+            if time.monotonic() - stamp > timeout:
+                raise MQTTPacketException("timed out waiting for " + str(MQTT_SUBACK) + " fixed header byte")
 
     def _mqtt_ping(self):
         """ Ping the MQTT broker
@@ -197,33 +188,27 @@ class CellMQTT:
         Raises:
             Exception: Raised if no valid ping response is received from the MQTT broker
         """
-        self._send_at_cmd('CIPSEND=2')
-        self._ser.write(b'\xc0\x00')
-        ping_timeout = self._mqtt_keepalive
-        stamp = time.monotonic()
-        res = None
-        while res != MQTT_PINGRESP:
-            res = self._get_mqtt_ping_msg()
-            if res:
-                self._log.debug('mqtt ping got response from broker')
-            if time.monotonic() - stamp > ping_timeout:
-                raise Exception("mqtt ping did not get response from broker")
+        self._tcp_send(b'\xc0\x00')
+        self._wait_for_mqtt_fixed_header(MQTT_PINGRESP)
+        self._log.debug('mqtt ping got response from broker')
+
 
     def _get_remaining_len(self) -> int:
-        """ Get the remaining length in the publish packet using some bitmath.
+        """ Get the remaining length
+            http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718023
 
         Returns:
             int
         """
-        n = 0
-        sh = 0
-        b = bytearray(1)
+        len = 0
+        offset = 0
+        read_byte = bytearray(1)
         while True:
-            b = self._ser.read(1)[0]
-            n |= (b & 0x7F) << sh
-            if not b & 0x80:
-                return n
-            sh += 7
+            read_byte = self._ser.read(1)[0]
+            len |= (read_byte & 0x7F) << offset
+            if not read_byte & 0x80:
+                return len
+            offset += 7
 
     def _check_for_publish_messages(self) -> None:
         """ Read serial bus one byte at a time, waiting for a MQTT_PUBLISH packet to arrive
@@ -256,10 +241,26 @@ class CellMQTT:
 
     def _send_queued_publish_jobs(self):
         if self._queued_publish_bytes:
-            self._send_at_cmd('CIPSEND=' + str(self._queued_publish_bytes))
+            payload = b""
             while len(self._publish_jobs):
-                self._ser.write(self._publish_jobs.pop())
+                payload = payload + self._publish_jobs.pop()
+            self._tcp_send(payload)
             self._queued_publish_bytes=0
+
+    def _tcp_send(self, data: bytes):
+        attempts: int = 0
+        ready_to_send: bool = False
+        while not ready_to_send:
+            if attempts > 5:
+                raise Exception('error initiating tcp send')
+            attempts = attempts + 1
+            self._send_at_cmd('CIPSEND=' + str(len(data)))
+            ready_to_send = self._await_serial_response(b'>')
+            if attempts:
+                time.sleep(1)
+        self._ser.write(data)
+        self._await_serial_response(b"SEND OK")
+
 
     def connect(self, 
     client_id: str = config['MQTT_BROKER']['MQTTClientID'], 
@@ -286,19 +287,15 @@ class CellMQTT:
         self._mqtt_keepalive = keep_alive
         connect = mqtt_codec.packet.MqttConnect(client_id=client_id, clean_session=False, keep_alive=30, username=username, password=password)
         with BytesIO() as f:
-            num_bytes_written = connect.encode(f)
+            connect.encode(f)
             buf = f.getvalue()
-            self._send_at_cmd('CIPSEND=' + str(num_bytes_written))
-            connack_packet = self._send_cmd_await_response(buf,3,burn_bytes=12)
-            try:
-                self._process_connack(connack_packet)
-                if(keep_alive is not None):
-                    schedule.every(math.ceil(keep_alive/2)).seconds.do(self._mqtt_ping)
-                self._log.info('Sucessfully connected to MQTT broker.')
-            except MQTTPacketException:
-                # if there was a problem reading the connack packet, reconnect
-                time.sleep(5)
-                self._connect(client_id, host, port, username, password, keep_alive)
+            self._tcp_send(buf)
+            connack_packet = self._ser.read(6)[-3:]
+            self._log.debug("Got connack: " + str(connack_packet))
+            self._process_connack(connack_packet)
+            if(keep_alive is not None):
+                schedule.every(keep_alive).seconds.do(self._mqtt_ping)
+            self._log.info('Sucessfully connected to MQTT broker.')
 
     def publish(self, topic: str, message: bytearray, dupe: bool = False, qos: int = 0, retain: bool = False):
         """ Publish a message to a MQTT topic
@@ -310,7 +307,7 @@ class CellMQTT:
             qos (int, optional): Defaults to 0.
             retain (bool, optional): Defaults to False.
         """
-        publish = mqtt_codec.packet.MqttPublish(3, topic, message.encode(), dupe, qos, retain)
+        publish = mqtt_codec.packet.MqttPublish(5, topic, message.encode(), dupe, qos, retain)
         with BytesIO() as f:
             num_bytes_written = publish.encode(f)
             buf = f.getvalue()
@@ -333,14 +330,12 @@ class CellMQTT:
         """
         subscribe = mqtt_codec.packet.MqttSubscribe(3, [mqtt_codec.packet.MqttTopic(topic, 0)])
         with BytesIO() as f:
-            num_bytes_written = subscribe.encode(f)
+            subscribe.encode(f)
             buf = f.getvalue()
-            self._send_at_cmd('CIPSEND=' + str(num_bytes_written))
-            res = self._send_cmd_await_response(buf,5,burn_bytes=11)
-            if(len(res) is not 5):
-                raise MQTTPacketException('subscription error: invalid packet length')
-            if(res[0] is not 0x90):
-                raise MQTTPacketException('subscription error: invalid fixed header')
+            self._tcp_send(buf)
+            res = self._ser.read(7)[-5:]
+            if res[0] & MQTT_PKT_TYPE_MASK == MQTT_SUBACK:
+                raise MQTTPacketException('subscription error: invalid suback header')
             self._log.debug('suback packet: ' + str(res))
             self._log.debug('Subscribed to topic: "' + topic + '"')
             self._sub_handlers[topic] = handler
@@ -350,4 +345,3 @@ class CellMQTT:
             schedule.run_pending()
             self._check_for_publish_messages()
             self._send_queued_publish_jobs()
-            time.sleep(.05)
