@@ -31,18 +31,12 @@ MQTT_DISCONNECT = b"\xe0\0"
 class WirelessChip(Enum):
     SIM800C = 1
 
-class CMDType(Enum):
-    AT = 1
-    BYTES = 2
-
 class MQTTPacketException(Exception):
     """ Malformed or unexpected packets read off the serial bus
     """
     pass
 
 #An actual error received from the MQTT broker, possible error codes:
-
-
 class MQTTServerException(Exception):
     """ Malformed or unexpected packets read off the serial bus
     	
@@ -55,8 +49,6 @@ class MQTTServerException(Exception):
     pass
 
 class CellMQTT:
-    """ Cellular MQTT Library for IoT devices like the Raspberry Pi
-    """
     _sub_handlers = {}
     _publish_jobs = []
     _queued_publish_bytes = 0
@@ -81,33 +73,17 @@ class CellMQTT:
         self._ser = serial.Serial(serial_path, baud_rate, timeout = int(timeout))
         self._cell_chip = cell_chip
         self._cell_apn = cell_apn
-        logging.basicConfig(level=log_level, format='%(asctime)s - %(message)s', )
+        logging.basicConfig(level=log_level, format='%(asctime)s [%(levelname)s] %(message)s', )
         self._log = logging.getLogger(__name__)
 
     def _format_at_cmd_sim800c(self, data: str) -> bytes:
-        """ AT command formatting for SIM800c chip
-
-        Args:
-            data (str): The actual command to be sent to the device
-
-        Returns:
-            bytes: encoded data to be written to serial bus
-        """
         data = 'AT+' + data + '\r\n'
         return data.encode()
 
-    def _at_disable_echo_sim800c(self):
-        """ Command to disable echoing on serial bus - without this the SIM800c will echo back all data written to it
-        """
+    def _at_disable_echo_sim800c(self) -> None:
         self._ser.write('ATE0\r\n'.encode())
 
-    def _send_at_cmd(self, data: str, wait_time: float = .4):
-        """ Send AT command to cellular module
-
-        Args:
-            data (str): Raw, unformatted command text
-            read (bool, optional): If set to true, the command will read from the bus, even if it is not printing to log. Defaults to True.
-        """
+    def _send_at_cmd(self, data: str, wait_time: float = .4) -> None:
         self._ser.write(self._format_at_cmd_sim800c(data))
         self._log.debug(str(data))
         if(wait_time):
@@ -119,23 +95,10 @@ class CellMQTT:
         self._log.debug('Result:' + str(result))
         return result == expected
 
-    def _tcp_connect_sim800c(self, host: str, port: int, tls: bool = False):
-        """ Establish a TCP connection to a remote host
-
-        Args:
-            host (str)
-            port (int)
-            tls (bool, optional): When set to True, the SIM800c will attempt TLSv1 negotiation. Note that the chip 
-            is unfortunately not capable of any TLS version above TLSv1. Defaults to False.
-
-        Raises:
-            Exception: Will be raised when TCP connection can't be negotiated. This can either be caught by user
-            or cause the program to exit and be restarted by a supervisor like systemd.
-        """
+    def _tcp_connect_sim800c(self, host: str, port: int, tls: bool = False) -> None:
         self._log.info('Establishing TCP connection...')
         self._send_at_cmd('CIPCLOSE', wait_time=2)
         self._send_at_cmd('CIPSHUT', wait_time=2)
-        # self._send_at_cmd('CGATT?')
         self._send_at_cmd('CSTT="{}"'.format(self._cell_apn))
         self._send_at_cmd('CIICR', wait_time=2)
         self._send_at_cmd('CIFSR', wait_time=2)
@@ -147,17 +110,8 @@ class CellMQTT:
             raise Exception('could not establish tcp connection with server')
         self._log.info('TCP connection established.')
 
+    # http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718033
     def _process_connack(self, packet: bytearray):
-        """ Process the MQTT connack packet - see more here: 
-        http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718033
-
-        Args:
-            packet (bytearray): Raw connack packet to be validated
-
-        Raises:
-            MQTTPacketException
-            MQTTServerException
-        """
         if(len(packet) != 3):
             raise MQTTPacketException('connack error: invalid packet length')
         if(packet[0] != 0x02):
@@ -166,31 +120,24 @@ class CellMQTT:
             raise MQTTServerException('connack error: server refused connection with error code: ' + str(packet[2]))
         self._log.debug('connack packet: ' + str(packet))
 
-    def _wait_for_mqtt_fixed_header(self, header_type, timeout: int = 5) -> bytes:
-        """ Wait for a MQTT fixed header 
-        """
+    def _mqtt_await_fixed_header(self, type, timeout: int = 2) -> bytes:
         res = bytearray(1)
         stamp = time.monotonic()
-        while res[0] != header_type:
+        while res[0] != type:
             res = self._ser.read(1)
-            if res[0] & MQTT_PKT_TYPE_MASK == header_type:
+            if res and res[0] & MQTT_PKT_TYPE_MASK == type:
                 return res
+            time.sleep(.01)
             if time.monotonic() - stamp > timeout:
-                raise MQTTPacketException("timed out waiting for " + str(MQTT_SUBACK) + " fixed header byte")
+                raise MQTTPacketException("timed out waiting for " + str(type) + " fixed header byte")
 
-    def _mqtt_ping(self):
+    def _mqtt_ping(self) -> None:
         self._tcp_send(b'\xc0\x00')
-        self._wait_for_mqtt_fixed_header(MQTT_PINGRESP)
+        self._mqtt_await_fixed_header(MQTT_PINGRESP)
         self._log.debug('mqtt ping got response from broker')
 
-
+    # http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718023
     def _get_remaining_len(self) -> int:
-        """ Get the remaining length
-            http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718023
-
-        Returns:
-            int
-        """
         len = 0
         offset = 0
         read_byte = bytearray(1)
@@ -201,15 +148,11 @@ class CellMQTT:
                 return len
             offset += 7
 
-    def _check_for_publish_messages(self) -> None:
-        """ Read serial bus one byte at a time, waiting for a MQTT_PUBLISH packet to arrive
-
-        Raises:
-            MQTTPacketException: Raised if the packet is malformed
-        """
+    def _mqtt_poll_incoming_message(self) -> None:
         res = self._ser.read(1)
         if res in [None, b"", b"\x00"]:
             return None
+        # http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718018
         if res[0] & MQTT_PKT_TYPE_MASK == MQTT_PUBLISH:
             remaining_len = self._get_remaining_len()
             topic_len = self._ser.read(2)
@@ -219,6 +162,7 @@ class CellMQTT:
             topic = str(self._ser.read(topic_len), 'utf-8')
             remaining_len -= topic_len + 2
             pid = 0
+            # http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718039
             if res[0] & 0x06:
                 pid = self._ser.read(2)
                 pid = pid[0] << 0x08 | pid[1]
@@ -230,7 +174,7 @@ class CellMQTT:
             self._log.debug('got message for topic: ' + topic )
             self._log.debug('payload: ' + msg )
 
-    def _send_queued_publish_jobs(self):
+    def _send_queued_publish_jobs(self) -> None:
         if self._queued_publish_bytes:
             payload = b""
             while len(self._publish_jobs):
@@ -238,21 +182,23 @@ class CellMQTT:
             self._tcp_send(payload)
             self._queued_publish_bytes=0
 
-    def _tcp_send(self, data: bytes):
+    def _tcp_send(self, data: bytes) -> None:
         attempts: int = 0
         ready_to_send: bool = False
+        # Wait for the ">" char to be read from serial to signal tcp write ready
         while not ready_to_send:
             if attempts > 5:
                 raise Exception('error initiating tcp send')
-            attempts = attempts + 1
             self._send_at_cmd('CIPSEND=' + str(len(data)), wait_time=0)
             ready_to_send = self._await_serial_response(b'>')
             if attempts:
                 time.sleep(1)
+            attempts += 1
         self._ser.write(data)
+        # Write Ctrl-Z to signal end of write
+        self._ser.write(chr(26).encode('utf-8'))
         if not self._await_serial_response(b"SEND OK"):
-            raise Exception("error on TCP send")
-
+            self._log.warning('tcp send did not return expected "SEND OK"')
 
     def connect(self, 
     client_id: str = config['MQTT_BROKER']['MQTTClientID'], 
@@ -290,15 +236,6 @@ class CellMQTT:
             self._log.info('Sucessfully connected to MQTT broker.')
 
     def publish(self, topic: str, message: bytearray, dupe: bool = False, qos: int = 0, retain: bool = False):
-        """ Publish a message to a MQTT topic
-
-        Args:
-            topic (str)
-            message (bytearray)
-            dupe (bool, optional): Defaults to False.
-            qos (int, optional): Defaults to 0.
-            retain (bool, optional): Defaults to False.
-        """
         publish = mqtt_codec.packet.MqttPublish(5, topic, message.encode(), dupe, qos, retain)
         with BytesIO() as f:
             num_bytes_written = publish.encode(f)
@@ -335,5 +272,5 @@ class CellMQTT:
     def loop(self):
         while True:
             schedule.run_pending()
-            self._check_for_publish_messages()
+            self._mqtt_poll_incoming_message()
             self._send_queued_publish_jobs()
