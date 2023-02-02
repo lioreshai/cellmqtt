@@ -2,6 +2,7 @@
 import os
 import math
 import time
+import random
 import serial
 
 import logging
@@ -24,7 +25,7 @@ MQTT_PUBLISH = 0x30
 MQTT_PINGREQ = b"\xc0\0"
 MQTT_PINGRESP = 0xD0
 MQTT_SUB = b"\x82"
-MQTT_SUBACK = 0x40
+MQTT_SUBACK = 0x90
 MQTT_UNSUB = b"\xA2"
 MQTT_DISCONNECT = b"\xe0\0"
 
@@ -198,7 +199,7 @@ class CellMQTT:
         # Write Ctrl-Z to signal end of write
         self._ser.write(chr(26).encode('utf-8'))
         if not self._await_serial_response(b"SEND OK"):
-            self._log.warning('tcp send did not return expected "SEND OK"')
+            self._log.warn('tcp send did not return expected "SEND OK"')
 
     def connect(self, 
     client_id: str = config['MQTT_BROKER']['MQTTClientID'], 
@@ -243,30 +244,30 @@ class CellMQTT:
             self._publish_jobs.append(buf)
             self._queued_publish_bytes = self._queued_publish_bytes + num_bytes_written
 
-    def subscribe(self, topic: str, handler: Callable[[str,bytes],None]):
+    def subscribe(self, topic: str, handler: Callable[[str,bytes],None], max_qos=0):
         """ Subscribe to a MQTT topic
 
         Args:
             topic (str)
             handler (Callable[[str,bytes],None]): This function will be called when a message arrives on this topic
               > The function should accept two arguments: topic (str) and message (bytes)
-
-        Raises:
-            MQTTPacketException: Raised if the server does not send back a valid subscription acknowledgement
-            packet. 
-
-            More: http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718068
         """
-        subscribe = mqtt_codec.packet.MqttSubscribe(3, [mqtt_codec.packet.MqttTopic(topic, 0)])
+        pid = random.randint(0,65535)
+        subscribe = mqtt_codec.packet.MqttSubscribe(pid, [mqtt_codec.packet.MqttTopic(topic, max_qos)])
         with BytesIO() as f:
             subscribe.encode(f)
             buf = f.getvalue()
             self._tcp_send(buf)
-            res = self._ser.read(7)[-5:]
-            if res[0] & MQTT_PKT_TYPE_MASK == MQTT_SUBACK:
+            res = self._ser.read(6)[-4:]
+            remaining_len = res[1]
+            payload = self._ser.read(remaining_len-2)
+            if res[0] & MQTT_PKT_TYPE_MASK != MQTT_SUBACK:
                 raise MQTTPacketException('subscription error: invalid suback header')
+            # Validate this suback is for given PID
+            if res[2] << 8 | res[3] != pid:
+                raise MQTTPacketException('subscription error: incorrect suback pid value')
             self._log.debug('suback packet: ' + str(res))
-            self._log.debug('Subscribed to topic: "' + topic + '"')
+            self._log.info('Subscribed to topic: "' + topic + '" Return code: ' + str(payload))
             self._sub_handlers[topic] = handler
 
     def loop(self):
