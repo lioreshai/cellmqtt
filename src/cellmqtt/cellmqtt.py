@@ -1,14 +1,11 @@
-
 import os
 import math
 import time
 import random
 import serial
-
 import logging
 import schedule
 import configparser
-import mqtt_codec.io
 import mqtt_codec.packet
 
 from enum import Enum
@@ -86,12 +83,12 @@ class CellMQTT:
         self._log.info('Establishing TCP connection...')
         self._serial_write_at_cmd('CIPCLOSE', wait_time=2)
         self._serial_write_at_cmd('CIPSHUT', wait_time=2)
-        self._serial_write_at_cmd('CSTT="{}"'.format(self._cell_apn))
+        self._serial_write_at_cmd('CSTT="{}"'.format(self._cell_apn), wait_time=2)
         self._serial_write_at_cmd('CIICR', wait_time=2)
         self._serial_write_at_cmd('CIFSR', wait_time=2)
         if tls:
-            self._serial_write_at_cmd('CIPSSL=1')
-        self._serial_write_at_cmd('CIPSTART="TCP","' + host + '",' + str(port), wait_time=2)
+            self._serial_write_at_cmd('CIPSSL=1', wait_time=2)
+        self._serial_write_at_cmd('CIPSTART="TCP","' + host + '",' + str(port), wait_time=3)
         connected = self._serial_await_response(b'CONNECT OK')
         if not connected:
             raise Exception('could not establish tcp connection with server')
@@ -155,7 +152,7 @@ class CellMQTT:
             raise MQTTServerException('connack error: server refused connection with error code: ' + str(packet[2]))
         return [packet[2], packet[3]]
 
-    def _mqtt_await_fixed_header(self, type, timeout: int = 2) -> bytes:
+    def _mqtt_await_fixed_header(self, type, timeout: int = 5) -> bytes:
         res = bytearray(1)
         stamp = time.monotonic()
         while res[0] != type:
@@ -186,7 +183,7 @@ class CellMQTT:
     def _mqtt_process_incoming_message(self, first_byte: int) -> Tuple[str, bytes, int]:
         """
         Returns:
-            Tuple[str, bytes, int]: Topic name, message payload, Packet ID (PID)
+            Tuple[str, bytes, int]: topic name, message payload, packet ID (PID)
         """
         remaining_len = self._mqtt_get_remaining_len()
         topic_len = self._ser.read(2)
@@ -209,11 +206,11 @@ class CellMQTT:
             return None
         # http://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html#_Toc398718018
         if res[0] & MQTT_PKT_TYPE_MASK == MQTT_PUBLISH:
-            [topic, raw_msg, pid] = self._mqtt_process_incoming_message(res[0])
+            [topic, payload, pid] = self._mqtt_process_incoming_message(res[0])
             if topic in self._sub_handlers:
-                self._sub_handlers[topic](topic, raw_msg)
+                self._sub_handlers[topic](topic, payload)
             self._log.debug('got message for topic: ' + topic )
-            self._log.debug('payload: ' + str(raw_msg, "utf-8") )
+            self._log.debug('payload: ' + str(payload, "utf-8") )
             self._log.debug('pid: ' + str(pid) )
 
     def _mqtt_send_queued_publish_jobs(self) -> None:
@@ -277,7 +274,7 @@ class CellMQTT:
             handler (Callable[[str,bytes],None]): This function will be called when a message arrives on this topic
               > The function should accept two arguments: topic (str) and message (bytes)
         """
-        pid = self._mqtt_generate_pid()
+        pid = 0 if not max_qos else self._mqtt_generate_pid()
         subscribe = mqtt_codec.packet.MqttSubscribe(pid, [mqtt_codec.packet.MqttTopic(topic, max_qos)])
         with BytesIO() as f:
             subscribe.encode(f)
